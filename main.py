@@ -15,7 +15,6 @@ log = logging.getLogger("alquds")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID", "@MajmaAlQuds")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 if not BOT_TOKEN:
     raise RuntimeError("Set BOT_TOKEN in Render environment variables")
@@ -42,14 +41,12 @@ def get_font(size):
 
 def make_ad_image(raw, price):
     im = Image.open(BytesIO(raw)).convert("RGB")
-    im.thumbnail((1200, 1200))
+    im.thumbnail((1120, 1120))
     canvas = Image.new("RGB", (1200, 1450), "white")
     x = (1200 - im.width) // 2
-    y = 35 + (1200 - im.height) // 2
+    y = 35 + (1160 - im.height) // 2
     canvas.paste(im, (x, y))
-
     draw = ImageDraw.Draw(canvas)
-    # Clean footer, preserving the original product photo.
     draw.rectangle((0, 1240, 1200, 1450), fill=(24, 35, 52))
     draw.text((600, 1285), "مجمع القدس", font=get_font(58), fill="white", anchor="mm")
     draw.text((600, 1380), f"السعر: {price}", font=get_font(64), fill=(255, 220, 90), anchor="mm")
@@ -90,14 +87,12 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(price) > 40 or not any(ch.isdigit() for ch in price):
         await update.message.reply_text("أرسل السعر بالأرقام، مثلاً 15000")
         return
-
     try:
         image = make_ad_image(context.user_data["photo"], price)
-        caption = make_caption(price)
         await context.bot.send_photo(
             chat_id=CHANNEL_ID,
             photo=image,
-            caption=caption
+            caption=make_caption(price)
         )
         context.user_data.clear()
         await update.message.reply_text("تم نشر الإعلان بالقناة بنجاح ✅")
@@ -110,15 +105,16 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def error_handler(update, context):
     log.exception("Telegram update error", exc_info=context.error)
 
-def run_bot():
+def run_web():
+    port = int(os.environ.get("PORT", "10000"))
+    web.run(host="0.0.0.0", port=port, use_reloader=False)
+
+if __name__ == "__main__":
+    # Flask runs in a helper thread; Telegram polling runs on the main thread.
+    threading.Thread(target=run_web, daemon=True).start()
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
     app.add_error_handler(error_handler)
     app.run_polling(drop_pending_updates=True)
-
-if __name__ == "__main__":
-    threading.Thread(target=run_bot, daemon=True).start()
-    port = int(os.environ.get("PORT", "10000"))
-    web.run(host="0.0.0.0", port=port)
