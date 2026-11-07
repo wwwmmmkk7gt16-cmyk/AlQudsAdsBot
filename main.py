@@ -13,6 +13,7 @@ from flask import Flask
 from PIL import Image, ImageDraw, ImageFont
 from datetime import date, datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     MessageHandler, ContextTypes, filters
@@ -914,12 +915,18 @@ async def ad_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def ad_photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN or not context.user_data.get("ad_mode"):
         return
-    photo = update.message.photo[-1]
-    tg_file = await photo.get_file()
-    data = BytesIO()
-    await tg_file.download_to_memory(out=data)
-    context.user_data["ad_photo"] = data.getvalue()
-    await update.message.reply_text("وصلت الصورة ❤️ هسه أرسل السعر فقط، مثلاً 15000")
+    # Acknowledge immediately so the admin knows the photo update was received.
+    await update.message.reply_text("وصلتني الصورة ❤️ دا أحملها، لحظة... ")
+    try:
+        photo = update.message.photo[-1]
+        tg_file = await photo.get_file()
+        data = BytesIO()
+        await tg_file.download_to_memory(out=data, read_timeout=120, write_timeout=120, connect_timeout=30, pool_timeout=30)
+        context.user_data["ad_photo"] = data.getvalue()
+        await update.message.reply_text("تم استلام الصورة ❤️ هسه أرسل السعر فقط، مثلاً 15000")
+    except Exception:
+        log.exception("Downloading ad photo from Telegram failed")
+        await update.message.reply_text("وصلت الصورة، لكن تعذّر تحميلها من تيليجرام بسبب الاتصال. أعد إرسال الصورة بعد دقيقة.")
 
 async def ad_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN or not context.user_data.get("ad_mode"):
@@ -974,7 +981,17 @@ async def main_async():
     if not ADMIN:
         raise ValueError("Set ADMIN_ID in environment variables")
 
-    orders_app = Application.builder().token(ORDERS_TOKEN).build()
+    # Give Telegram API and file downloads generous timeouts; the free host can be slow.
+    def telegram_request():
+        return HTTPXRequest(
+            connection_pool_size=20,
+            connect_timeout=30,
+            read_timeout=120,
+            write_timeout=120,
+            pool_timeout=30,
+        )
+
+    orders_app = Application.builder().token(ORDERS_TOKEN).request(telegram_request()).get_updates_request(telegram_request()).build()
     orders_app.add_handler(CommandHandler("start", start))
     orders_app.add_handler(CommandHandler("admin", admin))
     orders_app.add_handler(CommandHandler("cancel", cancel))
@@ -984,7 +1001,7 @@ async def main_async():
     )
     orders_app.add_error_handler(error_handler)
 
-    ads_app = Application.builder().token(ADS_TOKEN).build()
+    ads_app = Application.builder().token(ADS_TOKEN).request(telegram_request()).get_updates_request(telegram_request()).build()
     ads_app.add_handler(CommandHandler("start", ad_start))
     ads_app.add_handler(CommandHandler("ad", ad_start))
     ads_app.add_handler(CommandHandler("cancel", cancel))
