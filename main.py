@@ -7,7 +7,9 @@ import base64
 import json
 import urllib.request
 import time
-from io import BytesIO
+import csv
+import re
+from io import BytesIO, StringIO
 
 from flask import Flask
 from PIL import Image, ImageDraw, ImageFont
@@ -150,6 +152,18 @@ def add_column(table, column, definition):
 
 add_column("products", "photo_id", "TEXT")
 add_column("products", "category_id", "INTEGER")
+add_column("products", "barcode", "TEXT")
+add_column("products", "source_sku", "TEXT")
+add_column("products", "source_handle", "TEXT")
+add_column("products", "visible", "INTEGER NOT NULL DEFAULT 1")
+add_column("products", "import_status", "TEXT")
+db.execute("""CREATE TABLE IF NOT EXISTS photo_matches (
+ id INTEGER PRIMARY KEY AUTOINCREMENT,
+ photo_id TEXT NOT NULL,
+ product_id INTEGER NOT NULL,
+ confidence REAL DEFAULT 0,
+ created_at TEXT DEFAULT CURRENT_TIMESTAMP
+)""")
 add_column("orders", "status", "TEXT DEFAULT 'جديد'")
 add_column("orders", "user_id", "INTEGER DEFAULT 0")
 add_column("orders", "subtotal", "INTEGER DEFAULT 0")
@@ -197,6 +211,8 @@ def admin_menu():
         [InlineKeyboardButton("🛍️ الطلبات الجديدة", callback_data="admin_orders")],
         [InlineKeyboardButton("🎟️ إدارة كوبونات الخصم", callback_data="admin_coupons")],
         [InlineKeyboardButton("🔥 إدارة العروض المؤقتة", callback_data="admin_offers")],
+        [InlineKeyboardButton("📥 استيراد منتجات Loyverse", callback_data="admin_import_help")],
+        [InlineKeyboardButton("📸 ربط صور بالجملة", callback_data="admin_bulk_help")],
     ])
 
 def categories_keyboard():
@@ -251,6 +267,177 @@ def order_status_keyboard(order_id, status):
     return InlineKeyboardMarkup(rows) if rows else None
 
 
+
+
+def _clean_int(value):
+    value = str(value or "").strip().replace(",", "")
+    if not value or value.lower() == "variable":
+        return None
+    try:
+        number = float(value)
+        return int(number) if number > 0 else None
+    except Exception:
+        return None
+
+
+def import_loyverse_csv(raw_bytes):
+    text = raw_bytes.decode("utf-8-sig", errors="replace")
+    reader = csv.DictReader(StringIO(text))
+    required = {"Name", "Price [مجمع القدس]"}
+    if not reader.fieldnames or not required.issubset(set(reader.fieldnames)):
+        raise ValueError("ملف CSV مو بصيغة تصدير Loyverse المتوقعة")
+    inserted = updated = skipped = 0
+    uncid = db.execute("SELECT id FROM categories WHERE name=?", ("غير مصنف",)).fetchone()[0]
+    for row in reader:
+        name = (row.get("Name") or "").strip()
+        if not name:
+            skipped += 1
+            continue
+        price = _clean_int(row.get("Price [مجمع القدس]"))
+        if price is None:
+            skipped += 1
+            continue
+        category = (row.get("Category") or "").strip() or "غير مصنف"
+        db.execute("INSERT OR IGNORE INTO categories(name) VALUES(?)", (category,))
+        cat_id = db.execute("SELECT id FROM categories WHERE name=?", (category,)).fetchone()[0]
+        sku = (row.get("SKU") or "").strip() or None
+        handle = (row.get("Handle") or "").strip() or None
+        barcode = (row.get("Barcode") or "").strip() or None
+        existing = None
+        if sku:
+            existing = db.execute("SELECT id FROM products WHERE source_sku=?", (sku,)).fetchone()
+        if not existing and barcode:
+            existing = db.execute("SELECT id FROM products WHERE barcode=?", (barcode,)).fetchone()
+        if not existing:
+            db.execute("""INSERT INTO products(name,price,description,category_id,barcode,source_sku,source_handle,visible,import_status)
+                          VALUES(?,?,?,?,?,?,?,0,'بانتظار الصورة')""",
+                       (name, price, (row.get("Description") or "").strip(), cat_id, barcode, sku, handle))
+            inserted += 1
+        else:
+            db.execute("""UPDATE products SET name=?,price=?,description=?,category_id=?,barcode=COALESCE(?,barcode),
+                          source_sku=COALESCE(?,source_sku),source_handle=COALESCE(?,source_handle),
+                          visible=CASE WHEN photo_id IS NULL THEN 0 ELSE visible END,
+                          import_status=CASE WHEN photo_id IS NULL THEN 'بانتظار الصورة' ELSE import_status END WHERE id=?""",
+                       (name, price, (row.get("Description") or "").strip(), cat_id, barcode, sku, handle, existing[0]))
+            updated += 1
+    db.commit()
+    return inserted, updated, skipped
+
+
+def _gemini_match_product(image_bytes, products):
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY غير مضبوط")
+    candidates = [{"id": p[0], "name": p[1], "category": p[2] or "", "barcode": p[3] or "", "sku": p[4] or ""} for p in products]
+    prompt = (
+        "أنت نظام مطابقة صور لمتجر. اختر المنتج المطابق للصورة من القائمة فقط. "
+        "اعتمد على النص الظاهر والباركود والشكل. لا تخمّن عند التشابه. "
+        "أرجع JSON فقط بالشكل: {\\\"product_id\\\": رقم أو null, \\\"confidence\\\": رقم من 0 إلى 1, \\\"reason\\\": \\\"سبب قصير بالعربية\\\"}. "
+        "إذا لا يوجد تطابق واضح اجعل product_id null و confidence أقل من 0.7.\nالقائمة:\n" + json.dumps(candidates, ensure_ascii=False)
+    )
+    url = ("https://generativelanguage.googleapis.com/v1beta/models/" f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}")
+    payload = {"contents": [{"parts": [{"text": prompt}, {"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(image_bytes).decode("ascii")}}]}],
+               "generationConfig": {"temperature": 0.1, "responseMimeType": "application/json", "maxOutputTokens": 120}}
+    req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=30) as response:
+        result = json.loads(response.read().decode())
+    parts = result.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+    raw = "".join(x.get("text", "") for x in parts).strip()
+    data = json.loads(raw)
+    return data
+
+
+async def import_csv_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN:
+        return
+    context.user_data["awaiting_loyverse_csv"] = True
+    await update.message.reply_text("📥 أرسل ملف تصدير Loyverse بصيغة CSV هنا. راح أضيف المنتجات وأخفيها عن الزبائن إلى أن نربط صورها.\nاكتب /cancel للإلغاء.")
+
+
+async def csv_document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN or not context.user_data.get("awaiting_loyverse_csv"):
+        return
+    doc = update.message.document
+    if not doc or not (doc.file_name or "").lower().endswith(".csv"):
+        await update.message.reply_text("أرسل ملف CSV فقط.")
+        return
+    tgfile = await doc.get_file()
+    buf = BytesIO()
+    await tgfile.download_to_memory(out=buf)
+    try:
+        inserted, updated, skipped = await asyncio.to_thread(import_loyverse_csv, buf.getvalue())
+    except Exception as exc:
+        log.exception("Loyverse CSV import failed")
+        await update.message.reply_text(f"تعذر استيراد الملف: {exc}")
+        return
+    context.user_data.pop("awaiting_loyverse_csv", None)
+    await update.message.reply_text(
+        f"✅ اكتمل الاستيراد\n➕ منتجات جديدة: {inserted}\n🔄 منتجات محدثة: {updated}\n"
+        f"⏭️ متروكة (سعر متغير/بيانات ناقصة): {skipped}\n\nهسه استخدم /bulkphotos وابدأ إرسال صور المنتجات."
+    )
+
+
+async def bulk_photos_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN:
+        return
+    count = db.execute("SELECT COUNT(*) FROM products WHERE visible=0 AND import_status='بانتظار الصورة'").fetchone()[0]
+    if not count:
+        await update.message.reply_text("ماكو منتجات مستوردة تنتظر الصور. استورد CSV أولاً باستخدام /importcsv")
+        return
+    context.user_data["bulk_photo_mode"] = True
+    context.user_data["bulk_photo_count"] = 0
+    await update.message.reply_text(
+        f"📸 وضع ربط الصور بالجملة اشتغل. عندك {count} منتج ينتظر الصورة.\n"
+        "أرسل الصور واحدة ورا الثانية أو كألبوم. راح أطابق الواضح تلقائياً، والمشكوك بيه أخليه للمراجعة.\n"
+        "لإنهاء الدفعة أرسل /endbulk"
+    )
+
+
+async def end_bulk_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN:
+        return
+    context.user_data.pop("bulk_photo_mode", None)
+    context.user_data.pop("bulk_photo_count", None)
+    pending = db.execute("SELECT COUNT(*) FROM photo_matches").fetchone()[0]
+    await update.message.reply_text(f"انتهى استقبال الصور. الصور اللي تحتاج مراجعة محفوظة: {pending}.")
+
+
+async def bulk_photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN or not context.user_data.get("bulk_photo_mode"):
+        return
+    photo = update.message.photo[-1]
+    tgfile = await photo.get_file()
+    buf = BytesIO()
+    await tgfile.download_to_memory(out=buf)
+    candidates = db.execute("""SELECT id,name,(SELECT name FROM categories c WHERE c.id=p.category_id),barcode,source_sku
+                               FROM products p WHERE visible=0 AND import_status='بانتظار الصورة' ORDER BY name LIMIT 250""").fetchall()
+    if not candidates:
+        context.user_data["bulk_photo_mode"] = False
+        await update.message.reply_text("🎉 خلصت كل المنتجات اللي كانت تنتظر الصور!")
+        return
+    try:
+        match = await asyncio.to_thread(_gemini_match_product, buf.getvalue(), candidates)
+        pid = match.get("product_id")
+        confidence = float(match.get("confidence", 0) or 0)
+        found = next((p for p in candidates if p[0] == pid), None)
+        if found and confidence >= 0.82:
+            db.execute("UPDATE products SET photo_id=?,visible=1,import_status='مرتبط تلقائياً' WHERE id=?", (photo.file_id, pid))
+            db.commit()
+            price = db.execute("SELECT price FROM products WHERE id=?", (pid,)).fetchone()[0]
+            await update.message.reply_text(f"✅ تم الربط: {found[1]}\nالسعر: {money(price)}\nالثقة: {confidence:.0%}")
+        elif found:
+            cur = db.execute("INSERT INTO photo_matches(photo_id,product_id,confidence) VALUES(?,?,?)", (photo.file_id, found[0], confidence))
+            db.commit()
+            mid = cur.lastrowid
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ اعتماد هذا المنتج", callback_data=f"matchapprove:{mid}"), InlineKeyboardButton("❌ تجاهل", callback_data=f"matchskip:{mid}")]])
+            price = db.execute("SELECT price FROM products WHERE id=?", (found[0],)).fetchone()[0]
+            await update.message.reply_photo(photo.file_id, caption=f"⚠️ تأكيد الربط مطلوب\nالاقتراح: {found[1]}\nالسعر: {money(price)}\nالثقة: {confidence:.0%}", reply_markup=kb)
+        else:
+            await update.message.reply_text(f"⚠️ ما لكيت تطابق واضح لهالصورة.\nالثقة: {confidence:.0%}\nجرّب تصور المنتج ويظهر اسمه أو باركوده بوضوح.")
+    except Exception:
+        log.exception("Bulk image matching failed")
+        await update.message.reply_text("تعذر تحليل هالصورة حالياً. خليها بدون ربط وجرب مرة ثانية بعدين.")
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db.execute("INSERT OR IGNORE INTO bot_users(user_id) VALUES(?)", (update.effective_user.id,))
     db.commit()
@@ -269,11 +456,11 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def show_products(q, category_id=None):
     if category_id is None:
         rows = db.execute(
-            "SELECT id,name,price,description,photo_id FROM products ORDER BY id DESC"
+            "SELECT id,name,price,description,photo_id FROM products WHERE visible=1 ORDER BY id DESC"
         ).fetchall()
     else:
         rows = db.execute(
-            "SELECT id,name,price,description,photo_id FROM products WHERE category_id=? ORDER BY id DESC",
+            "SELECT id,name,price,description,photo_id FROM products WHERE category_id=? AND visible=1 ORDER BY id DESC",
             (category_id,)
         ).fetchall()
     if not rows:
@@ -328,7 +515,7 @@ async def show_offer_admin(q):
     rows = db.execute(
         "SELECT o.id,p.name,o.original_price,o.offer_price,o.expires_at,o.active "
         "FROM offers o JOIN products p ON p.id=o.product_id "
-        "WHERE o.active=1 AND o.expires_at>? ORDER BY o.id DESC", (now,)
+        "WHERE o.active=1 AND o.expires_at>? AND p.visible=1 ORDER BY o.id DESC", (now,)
     ).fetchall()
     lines = ["🔥 العروض الفعالة:"]
     buttons = []
@@ -346,7 +533,7 @@ async def show_customer_offers(q):
     rows = db.execute(
         "SELECT p.id,p.name,o.original_price,o.offer_price,o.expires_at,p.description,p.photo_id "
         "FROM offers o JOIN products p ON p.id=o.product_id "
-        "WHERE o.active=1 AND o.expires_at>? ORDER BY o.id DESC", (now,)
+        "WHERE o.active=1 AND o.expires_at>? AND p.visible=1 ORDER BY o.id DESC", (now,)
     ).fetchall()
     if not rows:
         await q.message.reply_text("حالياً ماكو عروض سارية ❤️")
@@ -409,7 +596,26 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = q.from_user.id
     data = q.data
 
-    if data == "offers":
+    if uid == ADMIN and data.startswith("matchapprove:"):
+        mid = int(data.split(":")[1])
+        row = db.execute("SELECT photo_id,product_id FROM photo_matches WHERE id=?", (mid,)).fetchone()
+        if row:
+            db.execute("UPDATE products SET photo_id=?,visible=1,import_status='تم تأكيد الصورة' WHERE id=?", (row[0], row[1]))
+            db.execute("DELETE FROM photo_matches WHERE id=?", (mid,))
+            db.commit()
+            await q.message.reply_text("✅ تم ربط الصورة بالمنتج وإظهاره للزبائن.")
+        else:
+            await q.message.reply_text("انتهت صلاحية طلب المراجعة.")
+    elif uid == ADMIN and data.startswith("matchskip:"):
+        mid = int(data.split(":")[1])
+        db.execute("DELETE FROM photo_matches WHERE id=?", (mid,))
+        db.commit()
+        await q.message.reply_text("تم تجاهل المطابقة. المنتج بقي مخفياً.")
+    elif uid == ADMIN and data == "admin_import_help":
+        await q.message.reply_text("لاستيراد قائمة Loyverse استخدم الأمر /importcsv ثم أرسل ملف CSV.")
+    elif uid == ADMIN and data == "admin_bulk_help":
+        await q.message.reply_text("لربط الصور بالجملة استخدم /bulkphotos، أرسل الصور، ثم /endbulk عند الانتهاء.")
+    elif data == "offers":
         await show_customer_offers(q)
     elif uid == ADMIN and data == "admin_offers":
         await show_offer_admin(q)
@@ -897,6 +1103,8 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     states.pop(update.effective_user.id, None)
     context.user_data.pop("ad_mode", None)
     context.user_data.pop("ad_photo", None)
+    context.user_data.pop("awaiting_loyverse_csv", None)
+    context.user_data.pop("bulk_photo_mode", None)
     await update.message.reply_text("تم إلغاء العملية.")
 
 async def ad_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -984,6 +1192,11 @@ async def main_async():
     orders_app.add_handler(CommandHandler("start", start))
     orders_app.add_handler(CommandHandler("admin", admin))
     orders_app.add_handler(CommandHandler("cancel", cancel))
+    orders_app.add_handler(CommandHandler("importcsv", import_csv_command))
+    orders_app.add_handler(CommandHandler("bulkphotos", bulk_photos_command))
+    orders_app.add_handler(CommandHandler("endbulk", end_bulk_command))
+    orders_app.add_handler(MessageHandler(filters.Document.ALL, csv_document_handler))
+    orders_app.add_handler(MessageHandler(filters.PHOTO, bulk_photo_handler), group=1)
     orders_app.add_handler(CallbackQueryHandler(buttons))
     orders_app.add_handler(
         MessageHandler(filters.PHOTO | (filters.TEXT & ~filters.COMMAND), messages)
