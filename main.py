@@ -456,11 +456,11 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def show_products(q, category_id=None):
     if category_id is None:
         rows = db.execute(
-            "SELECT id,name,price,description,photo_id FROM products WHERE visible=1 ORDER BY id DESC"
+            "SELECT id,name,price,description,photo_id FROM products ORDER BY id DESC"
         ).fetchall()
     else:
         rows = db.execute(
-            "SELECT id,name,price,description,photo_id FROM products WHERE category_id=? AND visible=1 ORDER BY id DESC",
+            "SELECT id,name,price,description,photo_id FROM products WHERE category_id=? ORDER BY id DESC",
             (category_id,)
         ).fetchall()
     if not rows:
@@ -478,7 +478,8 @@ async def show_products(q, category_id=None):
         if photo:
             await q.message.reply_photo(photo, caption=text, reply_markup=kb)
         else:
-            await q.message.reply_text(text, reply_markup=kb)
+            # Imported products can be browsed before their photo is matched.
+            await q.message.reply_text(text + "\n📷 الصورة قريباً", reply_markup=kb)
 
 def coupon_discount(uid, subtotal):
     code = user_coupons.get(uid)
