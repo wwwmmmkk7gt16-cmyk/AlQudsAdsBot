@@ -56,7 +56,7 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 
 def _gemini_describe_product(image_bytes):
     if not GEMINI_API_KEY:
-        return "منتج مميز وعملي، اختياره يضيف لمسة حلوة لاستخدامك ❤️"
+        raise RuntimeError("GEMINI_API_KEY is missing from environment variables")
     url = ("https://generativelanguage.googleapis.com/v1beta/models/"
            f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}")
     payload = {"contents": [{"parts": [
@@ -82,9 +82,9 @@ def _gemini_describe_product(image_bytes):
         if not description:
             raise ValueError("Gemini returned empty description")
         return description[:650]
-    except Exception:
+    except Exception as exc:
         log.exception("Gemini product description failed")
-        return "منتج مميز وعملي، اختياره يضيف لمسة حلوة لاستخدامك ❤️"
+        raise RuntimeError(f"Gemini description failed: {exc}") from exc
 
 
 async def describe_product(image_bytes):
@@ -930,10 +930,10 @@ async def ad_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         description = await describe_product(raw_photo)
         image = make_ad_image(raw_photo, price)
         caption = (
-            f"🛍️ {description}\\n\\n"
-            f"💰 السعر: {price} دينار\\n"
-            "📩 للطلب والحجز: @LLL_54\\n"
-            "🚚 التوصيل مجاني داخل النجف\\n"
+            f"🛍️ {description}\n\n"
+            f"💰 السعر: {price} دينار\n"
+            "📩 للطلب والحجز: @LLL_54\n"
+            "🚚 التوصيل مجاني داخل النجف\n"
             "🛍️ مجمع القدس"
         )
         await context.bot.send_photo(chat_id=CHANNEL_ID, photo=image, caption=caption)
@@ -943,7 +943,7 @@ async def ad_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         log.exception("Publishing failed")
         await update.message.reply_text(
-            "ما كدرت أنشر الإعلان. تأكد أن البوت مشرف بالقناة وعنده صلاحية نشر الرسائل."
+            "ما اكتمل الإعلان. راجع سجل الاستضافة (Logs): غالباً مفتاح Gemini أو اسم الموديل، أو صلاحية النشر بالقناة."
         )
 
 
