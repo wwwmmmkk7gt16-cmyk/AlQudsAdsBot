@@ -13,13 +13,14 @@ from flask import Flask
 from PIL import Image, ImageDraw, ImageFont
 from datetime import date, datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     MessageHandler, ContextTypes, filters
 )
 
 logging.basicConfig(level=logging.INFO)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("alquds")
 ADS_TOKEN = os.getenv("BOT_TOKEN")
 ORDERS_TOKEN = os.getenv("ORDERS_BOT_TOKEN")
@@ -63,40 +64,34 @@ def _gemini_describe_product(image_bytes):
            f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}")
     payload = {"contents": [{"parts": [
         {"text": (
-            "شاهد صورة المنتج واكتب إعلاناً قصيراً جداً باللهجة العراقية "
-            "لمتجر اسمه مجمع القدس. اذكر اسم أو نوع المنتج بوضوح، ثم وصفاً "
-            "جذاباً من سطر واحد أو سطرين فقط. اعتمد على الظاهر بالصورة فقط. "
-            "لا تخترع خامة أو قياس أو ماركة أو مميزات غير ظاهرة. لا تذكر "
-            "السعر أو التوصيل أو التواصل. بدون مقدمات أو هاشتاغات أو اقتباس. "
-            "إذا لم تعرف نوعه بدقة، اكتب وصفاً عاماً صادقاً."
+            "شاهد صورة المنتج واكتب وصفاً إعلانياً قصيراً جداً باللهجة العراقية "
+            "لمجمع القدس. اذكر نوع المنتج إذا كان واضحاً، ثم ميزة ظاهرة واحدة فقط. "
+            "لا تخترع ماركة أو خامة أو قياساً أو مواصفات. لا تذكر السعر أو التوصيل "
+            "أو وسيلة التواصل. اكتب جملة واحدة قصيرة فقط."
         )},
         {"inline_data": {"mime_type": "image/jpeg",
                          "data": base64.b64encode(image_bytes).decode("ascii")}}
-    ]}], "generationConfig": {"temperature": 0.65, "maxOutputTokens": 100}}
+    ]}], "generationConfig": {"temperature": 0.4, "maxOutputTokens": 80}}
     request = urllib.request.Request(
         url, data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"}, method="POST")
-    last_error = None
-    # Gemini may respond slowly; allow a longer read timeout and retry once.
-    for attempt in range(2):
-        try:
-            with urllib.request.urlopen(request, timeout=90) as response:
-                result = json.loads(response.read().decode("utf-8"))
-            parts = result.get("candidates", [{}])[0].get("content", {}).get("parts", [])
-            description = " ".join(p.get("text", "").strip() for p in parts if p.get("text")).strip()
-            if not description:
-                raise ValueError("Gemini returned empty description")
-            return description[:650]
-        except Exception as exc:
-            last_error = exc
-            log.exception("Gemini product description attempt %s failed", attempt + 1)
-            if attempt == 0:
-                time.sleep(2)
-    raise RuntimeError(f"Gemini description failed after retry: {last_error}") from last_error
+    # One short attempt only: Gemini must never hold up the whole ad workflow.
+    with urllib.request.urlopen(request, timeout=20) as response:
+        result = json.loads(response.read().decode("utf-8"))
+    parts = result.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+    description = " ".join(p.get("text", "").strip() for p in parts if p.get("text")).strip()
+    if not description:
+        raise ValueError("Gemini returned empty description")
+    return description[:350]
 
 
 async def describe_product(image_bytes):
-    return await asyncio.to_thread(_gemini_describe_product, image_bytes)
+    try:
+        return await asyncio.to_thread(_gemini_describe_product, image_bytes)
+    except Exception as exc:
+        # Publish safely even when Gemini is unavailable; do not repeat a false product claim.
+        log.warning("Gemini unavailable; publishing with neutral fallback: %s", type(exc).__name__)
+        return "✨ منتج متوفر هسه، شوفوا تفاصيله بالصورة"
 
 
 def make_ad_image(raw, price):
@@ -915,18 +910,21 @@ async def ad_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def ad_photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN or not context.user_data.get("ad_mode"):
         return
-    # Acknowledge immediately so the admin knows the photo update was received.
-    await update.message.reply_text("وصلتني الصورة ❤️ دا أحملها، لحظة... ")
+    await update.message.reply_text("وصلتني الصورة ❤️ دا أحفظها، انتظر لحظة...")
     try:
         photo = update.message.photo[-1]
         tg_file = await photo.get_file()
         data = BytesIO()
-        await tg_file.download_to_memory(out=data, read_timeout=120, write_timeout=120, connect_timeout=30, pool_timeout=30)
+        await tg_file.download_to_memory(out=data)
         context.user_data["ad_photo"] = data.getvalue()
-        await update.message.reply_text("تم استلام الصورة ❤️ هسه أرسل السعر فقط، مثلاً 15000")
-    except Exception:
-        log.exception("Downloading ad photo from Telegram failed")
-        await update.message.reply_text("وصلت الصورة، لكن تعذّر تحميلها من تيليجرام بسبب الاتصال. أعد إرسال الصورة بعد دقيقة.")
+        await update.message.reply_text("تم حفظ الصورة ✅ هسه أرسل السعر فقط، مثلاً 15000")
+    except Exception as exc:
+        log.exception("Could not download product photo")
+        await update.message.reply_text(
+            "وصلتني الصورة، لكن تعذّر تنزيلها من تيليجرام بسبب الاتصال. "
+            "انتظر قليلاً وأعد إرسال الصورة."
+        )
+
 
 async def ad_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN or not context.user_data.get("ad_mode"):
@@ -954,10 +952,11 @@ async def ad_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("ad_mode", None)
         context.user_data.pop("ad_photo", None)
         await update.message.reply_text("تم نشر الإعلان بالقناة بنجاح ✅")
-    except Exception:
+    except Exception as exc:
         log.exception("Publishing failed")
         await update.message.reply_text(
-            "ما اكتمل الإعلان. راجع سجل الاستضافة (Logs): غالباً مفتاح Gemini أو اسم الموديل، أو صلاحية النشر بالقناة."
+            "ما اكتمل نشر الإعلان. تأكد من اتصال تيليجرام وصلاحية البوت بالقناة، "
+            "وبعدها جرّب مرة ثانية."
         )
 
 
@@ -981,17 +980,7 @@ async def main_async():
     if not ADMIN:
         raise ValueError("Set ADMIN_ID in environment variables")
 
-    # Give Telegram API and file downloads generous timeouts; the free host can be slow.
-    def telegram_request():
-        return HTTPXRequest(
-            connection_pool_size=20,
-            connect_timeout=30,
-            read_timeout=120,
-            write_timeout=120,
-            pool_timeout=30,
-        )
-
-    orders_app = Application.builder().token(ORDERS_TOKEN).request(telegram_request()).get_updates_request(telegram_request()).build()
+    orders_app = Application.builder().token(ORDERS_TOKEN).build()
     orders_app.add_handler(CommandHandler("start", start))
     orders_app.add_handler(CommandHandler("admin", admin))
     orders_app.add_handler(CommandHandler("cancel", cancel))
@@ -1001,7 +990,7 @@ async def main_async():
     )
     orders_app.add_error_handler(error_handler)
 
-    ads_app = Application.builder().token(ADS_TOKEN).request(telegram_request()).get_updates_request(telegram_request()).build()
+    ads_app = Application.builder().token(ADS_TOKEN).build()
     ads_app.add_handler(CommandHandler("start", ad_start))
     ads_app.add_handler(CommandHandler("ad", ad_start))
     ads_app.add_handler(CommandHandler("cancel", cancel))
