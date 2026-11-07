@@ -3,6 +3,9 @@ import asyncio
 import sqlite3
 import logging
 import threading
+import base64
+import json
+import urllib.request
 from io import BytesIO
 
 from flask import Flask
@@ -44,6 +47,49 @@ def get_font(size):
         if os.path.exists(path):
             return ImageFont.truetype(path, size)
     return ImageFont.load_default()
+
+
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+
+
+def _gemini_describe_product(image_bytes):
+    if not GEMINI_API_KEY:
+        return "منتج مميز وعملي، اختياره يضيف لمسة حلوة لاستخدامك ❤️"
+    url = ("https://generativelanguage.googleapis.com/v1beta/models/"
+           f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}")
+    payload = {"contents": [{"parts": [
+        {"text": (
+            "شاهد صورة المنتج واكتب إعلاناً قصيراً جداً باللهجة العراقية "
+            "لمتجر اسمه مجمع القدس. اذكر اسم أو نوع المنتج بوضوح، ثم وصفاً "
+            "جذاباً من سطر واحد أو سطرين فقط. اعتمد على الظاهر بالصورة فقط. "
+            "لا تخترع خامة أو قياس أو ماركة أو مميزات غير ظاهرة. لا تذكر "
+            "السعر أو التوصيل أو التواصل. بدون مقدمات أو هاشتاغات أو اقتباس. "
+            "إذا لم تعرف نوعه بدقة، اكتب وصفاً عاماً صادقاً."
+        )},
+        {"inline_data": {"mime_type": "image/jpeg",
+                         "data": base64.b64encode(image_bytes).decode("ascii")}}
+    ]}], "generationConfig": {"temperature": 0.65, "maxOutputTokens": 100}}
+    request = urllib.request.Request(
+        url, data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=35) as response:
+            result = json.loads(response.read().decode("utf-8"))
+        parts = result.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+        description = " ".join(p.get("text", "").strip() for p in parts if p.get("text")).strip()
+        if not description:
+            raise ValueError("Gemini returned empty description")
+        return description[:650]
+    except Exception:
+        log.exception("Gemini product description failed")
+        return "منتج مميز وعملي، اختياره يضيف لمسة حلوة لاستخدامك ❤️"
+
+
+async def describe_product(image_bytes):
+    return await asyncio.to_thread(_gemini_describe_product, image_bytes)
+
 
 def make_ad_image(raw, price):
     im = Image.open(BytesIO(raw)).convert("RGB")
@@ -879,10 +925,12 @@ async def ad_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("أرسل السعر بالأرقام، مثلاً 15000")
         return
     try:
-        image = make_ad_image(context.user_data["ad_photo"], price)
+        raw_photo = context.user_data["ad_photo"]
+        await update.message.reply_text("⏳ دا أجهز وصف المنتج وأنشر الإعلان...")
+        description = await describe_product(raw_photo)
+        image = make_ad_image(raw_photo, price)
         caption = (
-            "✨ وصل حديثاً إلى مجمع القدس ✨\\n\\n"
-            "اختيار مميز وبسعر مناسب، لا تفوّت الفرصة!\\n\\n"
+            f"🛍️ {description}\\n\\n"
             f"💰 السعر: {price} دينار\\n"
             "📩 للطلب والحجز: @LLL_54\\n"
             "🚚 التوصيل مجاني داخل النجف\\n"
@@ -894,7 +942,10 @@ async def ad_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("تم نشر الإعلان بالقناة بنجاح ✅")
     except Exception:
         log.exception("Publishing failed")
-        await update.message.reply_text("ما كدرت أنشر الإعلان. تأكد أن البوت مشرف بالقناة وعنده صلاحية نشر الرسائل.")
+        await update.message.reply_text(
+            "ما كدرت أنشر الإعلان. تأكد أن البوت مشرف بالقناة وعنده صلاحية نشر الرسائل."
+        )
+
 
 async def error_handler(update, context):
     log.exception("Telegram update error", exc_info=context.error)
