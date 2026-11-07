@@ -6,6 +6,7 @@ import threading
 import base64
 import json
 import urllib.request
+import time
 from io import BytesIO
 
 from flask import Flask
@@ -74,17 +75,23 @@ def _gemini_describe_product(image_bytes):
     request = urllib.request.Request(
         url, data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"}, method="POST")
-    try:
-        with urllib.request.urlopen(request, timeout=35) as response:
-            result = json.loads(response.read().decode("utf-8"))
-        parts = result.get("candidates", [{}])[0].get("content", {}).get("parts", [])
-        description = " ".join(p.get("text", "").strip() for p in parts if p.get("text")).strip()
-        if not description:
-            raise ValueError("Gemini returned empty description")
-        return description[:650]
-    except Exception as exc:
-        log.exception("Gemini product description failed")
-        raise RuntimeError(f"Gemini description failed: {exc}") from exc
+    last_error = None
+    # Gemini may respond slowly; allow a longer read timeout and retry once.
+    for attempt in range(2):
+        try:
+            with urllib.request.urlopen(request, timeout=90) as response:
+                result = json.loads(response.read().decode("utf-8"))
+            parts = result.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+            description = " ".join(p.get("text", "").strip() for p in parts if p.get("text")).strip()
+            if not description:
+                raise ValueError("Gemini returned empty description")
+            return description[:650]
+        except Exception as exc:
+            last_error = exc
+            log.exception("Gemini product description attempt %s failed", attempt + 1)
+            if attempt == 0:
+                time.sleep(2)
+    raise RuntimeError(f"Gemini description failed after retry: {last_error}") from last_error
 
 
 async def describe_product(image_bytes):
