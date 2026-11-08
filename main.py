@@ -565,9 +565,9 @@ async def show_products(q, category_id=None):
     for pid, name, price, desc, photo in rows:
         offer = active_offer(pid)
         if offer:
-            text = f"🔥 عرض مؤقت: {name}\\nالسعر السابق: {money(price)}\\n💰 سعر العرض: {money(offer[0])}\\n{desc or ''}"
+            text = f"🔥 عرض مؤقت: {name}\nالسعر السابق: {money(price)}\n💰 سعر العرض: {money(offer[0])}\n{desc or ''}"
         else:
-            text = f"🛍️ {name}\\n💰 {money(price)}\\n{desc or ''}"
+            text = f"🛍️ {name}\n💰 {money(price)}\n{desc or ''}"
         kb = InlineKeyboardMarkup([[
             InlineKeyboardButton("➕ أضف للسلة", callback_data=f"add:{pid}")
         ]])
@@ -617,12 +617,12 @@ async def show_offer_admin(q):
     lines = ["🔥 العروض الفعالة:"]
     buttons = []
     for oid, name, old_price, new_price, expiry, active in rows:
-        lines.append(f"• {name}: {money(old_price)} ← {money(new_price)}\\nينتهي: {expiry.replace('T', ' ')}")
+        lines.append(f"• {name}: {money(old_price)} ← {money(new_price)}\nينتهي: {expiry.replace('T', ' ')}")
         buttons.append([InlineKeyboardButton(f"⛔ إيقاف عرض {name[:25]}", callback_data=f"offerstop:{oid}")])
     if not rows:
         lines.append("ماكو عروض فعالة حالياً.")
     buttons.append([InlineKeyboardButton("➕ إنشاء عرض جديد", callback_data="offer_add")])
-    await q.message.reply_text("\\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons))
+    await q.message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons))
 
 
 async def show_customer_offers(q):
@@ -636,9 +636,9 @@ async def show_customer_offers(q):
         await q.message.reply_text("حالياً ماكو عروض سارية ❤️")
         return
     for pid, name, old_price, new_price, expiry, desc, photo in rows:
-        caption = (f"🔥 عرض مؤقت من مجمع القدس\\n🛍️ {name}\\n"
-                   f"قبل: {money(old_price)}\\n💰 هسه: {money(new_price)}\\n"
-                   f"⏰ ينتهي: {expiry.replace('T', ' ')}\\n{desc or ''}")
+        caption = (f"🔥 عرض مؤقت من مجمع القدس\n🛍️ {name}\n"
+                   f"قبل: {money(old_price)}\n💰 هسه: {money(new_price)}\n"
+                   f"⏰ ينتهي: {expiry.replace('T', ' ')}\n{desc or ''}")
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("➕ أضف للسلة بسعر العرض", callback_data=f"add:{pid}")]])
         if photo:
             await q.message.reply_photo(photo, caption=caption, reply_markup=kb)
@@ -655,7 +655,7 @@ async def show_coupon_admin(q):
         lines.append(f"{code}: خصم {amount} | الاستخدام {uses}/{maximum if maximum is not None else '∞'} | {'فعال' if active else 'متوقف'}")
         buttons.append([InlineKeyboardButton(("⛔ إيقاف " if active else "▶️ تفعيل ") + code, callback_data=("couponoff:" if active else "couponon:") + code)])
     buttons.append([InlineKeyboardButton("➕ إنشاء كوبون", callback_data="coupon_add")])
-    await q.message.reply_text("\\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons))
+    await q.message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons))
 
 
 async def show_cart(q, uid):
@@ -675,16 +675,16 @@ async def show_cart(q, uid):
             lines.append(f"{name}{offer_note} × {qty} = {money(price*qty)}")
     discount, code = coupon_discount(uid, subtotal)
     total = subtotal - discount
-    coupon_line = f"\\n🎟️ الكوبون: {code}\\n💸 الخصم: {money(discount)}" if code else "\\n🎟️ لا يوجد كوبون مطبق"
+    coupon_line = f"\n🎟️ الكوبون: {code}\n💸 الخصم: {money(discount)}" if code else "\n🎟️ لا يوجد كوبون مطبق"
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("🎟️ إدخال كوبون خصم", callback_data="apply_coupon")],
         [InlineKeyboardButton("❌ إزالة الكوبون", callback_data="remove_coupon")],
         [InlineKeyboardButton("✅ تثبيت الطلب", callback_data="checkout")],
         [InlineKeyboardButton("🗑️ إفراغ السلة", callback_data="clear")]
     ])
-    await q.message.reply_text("🛒 سلتك:\\n\\n" + "\\n".join(lines) +
-        f"\\n\\nالمجموع: {money(subtotal)}" + coupon_line +
-        f"\\n🚚 التوصيل مجاني\\n💰 الإجمالي: {money(total)}", reply_markup=kb)
+    await q.message.reply_text("🛒 سلتك:\n\n" + "\n".join(lines) +
+        f"\n\nالمجموع: {money(subtotal)}" + coupon_line +
+        f"\n🚚 التوصيل مجاني\n💰 الإجمالي: {money(total)}", reply_markup=kb)
 
 
 async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -731,7 +731,7 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.message.reply_text("المنتج غير موجود.")
             return
         states[uid] = {"step": "offer_price", "product_id": pid, "product_name": row[0], "original_price": row[1]}
-        await q.message.reply_text(f"🔥 المنتج: {row[0]}\\nالسعر الحالي: {money(row[1])}\\nاكتب سعر العرض بالدينار:")
+        await q.message.reply_text(f"🔥 المنتج: {row[0]}\nالسعر الحالي: {money(row[1])}\nاكتب سعر العرض بالدينار:")
     elif uid == ADMIN and data.startswith("offerstop:"):
         oid = int(data.split(":")[1])
         db.execute("UPDATE offers SET active=0 WHERE id=?", (oid,))
@@ -743,9 +743,9 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif uid == ADMIN and data == "coupon_add":
         states[uid] = {"step": "coupon_create"}
         await q.message.reply_text(
-            "أرسل بيانات الكوبون بهذا الشكل:\\n"
-            "CODE | percent أو fixed | القيمة | تاريخ الانتهاء YYYY-MM-DD أو - | عدد الاستخدامات أو -\\n\\n"
-            "مثال: ALQUDS10 | percent | 10 | 2026-12-31 | 100\\n"
+            "أرسل بيانات الكوبون بهذا الشكل:\n"
+            "CODE | percent أو fixed | القيمة | تاريخ الانتهاء YYYY-MM-DD أو - | عدد الاستخدامات أو -\n\n"
+            "مثال: ALQUDS10 | percent | 10 | 2026-12-31 | 100\n"
             "مثال: SAVE5000 | fixed | 5000 | - | -"
         )
     elif uid == ADMIN and (data.startswith("couponoff:") or data.startswith("couponon:")):
@@ -1032,9 +1032,9 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             db.commit()
             product = db.execute("SELECT photo_id FROM products WHERE id=?", (state["product_id"],)).fetchone()
-            caption = (f"🔥 عرض مؤقت من مجمع القدس\\n🛍️ {state['product_name']}\\n"
-                       f"قبل: {money(state['original_price'])}\\n💰 هسه: {money(state['offer_price'])}\\n"
-                       f"⏰ العرض لمدة {hours} ساعة\\n🚚 التوصيل مجاني داخل النجف")
+            caption = (f"🔥 عرض مؤقت من مجمع القدس\n🛍️ {state['product_name']}\n"
+                       f"قبل: {money(state['original_price'])}\n💰 هسه: {money(state['offer_price'])}\n"
+                       f"⏰ العرض لمدة {hours} ساعة\n🚚 التوصيل مجاني داخل النجف")
             kb = InlineKeyboardMarkup([[InlineKeyboardButton("🛍️ اطلبه هسه", callback_data=f"add:{state['product_id']}")]])
             recipients = {r[0] for r in db.execute("SELECT user_id FROM bot_users").fetchall()}
             recipients.update(r[0] for r in db.execute("SELECT DISTINCT user_id FROM orders WHERE user_id IS NOT NULL AND user_id!=0").fetchall())
@@ -1050,7 +1050,7 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     pass
             states.pop(uid, None)
             await update.message.reply_text(
-                f"✅ تم إنشاء العرض ونشره.\\n📨 وصل إلى {sent} زبون.\\n⏰ ينتهي: {expiry.replace('T', ' ')}",
+                f"✅ تم إنشاء العرض ونشره.\n📨 وصل إلى {sent} زبون.\n⏰ ينتهي: {expiry.replace('T', ' ')}",
                 reply_markup=admin_menu()
             )
             return
@@ -1136,7 +1136,7 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         code = value.upper()
         coupon, error = check_coupon(code)
         if error:
-            await update.message.reply_text(error + "\\nحاول مرة ثانية أو أرسل /cancel.")
+            await update.message.reply_text(error + "\nحاول مرة ثانية أو أرسل /cancel.")
             return
         user_coupons[uid] = code
         states.pop(uid, None)
@@ -1210,7 +1210,7 @@ async def ad_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     states.pop(ADMIN, None)
     context.user_data["ad_mode"] = True
     context.user_data.pop("ad_photo", None)
-    await update.message.reply_text("🖼️ إنشاء إعلان جديد\\nأرسل صورة المنتج، وبعدها أرسل السعر بالأرقام.")
+    await update.message.reply_text("🖼️ إنشاء إعلان جديد\nأرسل صورة المنتج، وبعدها أرسل السعر بالأرقام.")
 
 async def ad_photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN or not context.user_data.get("ad_mode"):
