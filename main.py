@@ -57,7 +57,7 @@ def get_font(size):
 
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 
 
 def _gemini_describe_product(image_bytes):
@@ -75,38 +75,17 @@ def _gemini_describe_product(image_bytes):
         {"inline_data": {"mime_type": "image/jpeg",
                          "data": base64.b64encode(image_bytes).decode("ascii")}}
     ]}], "generationConfig": {"temperature": 0.4, "maxOutputTokens": 80}}
-
-    last_error = None
-    for attempt, delay in enumerate((0, 4, 10, 18), start=1):
-        if delay:
-            time.sleep(delay)
-        request = urllib.request.Request(
-            url, data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"}, method="POST")
-        try:
-            with urllib.request.urlopen(request, timeout=60) as response:
-                result = json.loads(response.read().decode("utf-8"))
-            parts = result.get("candidates", [{}])[0].get("content", {}).get("parts", [])
-            description = " ".join(
-                part.get("text", "").strip() for part in parts if part.get("text")
-            ).strip()
-            if not description:
-                raise ValueError("Gemini returned empty description")
-            return description[:350]
-        except urllib.error.HTTPError as exc:
-            last_error = exc
-            if exc.code not in (429, 500, 502, 503, 504):
-                raise
-            log.warning("Ads Gemini temporary HTTP %s on attempt %s/4", exc.code, attempt)
-        except (TimeoutError, urllib.error.URLError, ConnectionError,
-                ValueError, json.JSONDecodeError) as exc:
-            last_error = exc
-            log.warning("Ads Gemini failed on attempt %s/4: %s", attempt, type(exc).__name__)
-
-    raise RuntimeError(
-        "Ads Gemini failed after 4 attempts: "
-        + (type(last_error).__name__ if last_error else "unknown error")
-    )
+    request = urllib.request.Request(
+        url, data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"}, method="POST")
+    # One short attempt only: Gemini must never hold up the whole ad workflow.
+    with urllib.request.urlopen(request, timeout=20) as response:
+        result = json.loads(response.read().decode("utf-8"))
+    parts = result.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+    description = " ".join(p.get("text", "").strip() for p in parts if p.get("text")).strip()
+    if not description:
+        raise ValueError("Gemini returned empty description")
+    return description[:350]
 
 
 async def describe_product(image_bytes):
@@ -186,10 +165,6 @@ db.execute("""CREATE TABLE IF NOT EXISTS photo_matches (
  confidence REAL DEFAULT 0,
  created_at TEXT DEFAULT CURRENT_TIMESTAMP
 )""")
-# Safe additive migrations: keep all existing product/order data intact.
-add_column("photo_matches", "candidate_ids", "TEXT")
-add_column("photo_matches", "suggestion_index", "INTEGER NOT NULL DEFAULT 0")
-add_column("photo_matches", "reason", "TEXT")
 add_column("orders", "status", "TEXT DEFAULT 'جديد'")
 add_column("orders", "user_id", "INTEGER DEFAULT 0")
 add_column("orders", "subtotal", "INTEGER DEFAULT 0")
@@ -364,9 +339,8 @@ def _gemini_match_product(image_bytes, products):
         "اعتمد على النص الظاهر والباركود والشكل. لا تخمّن عند التشابه. "
         "أرجع كائن JSON صالحاً فقط دون Markdown أو شرح، بالشكل: "
         "{\"product_id\": رقم أو null, \"confidence\": رقم من 0 إلى 1, "
-        "\"reason\": \"سبب قصير بالعربية\", \"suggestions\": [معرّفات أفضل 5 منتجات بالترتيب]}. "
-        "أدرج أفضل 5 احتمالات حتى لو كان التطابق غير مؤكد، ولا تخترع معرّفات. "
-        "إذا لا يوجد أي احتمال مناسب أعد product_id null و suggestions [].\n"
+        "\"reason\": \"سبب قصير بالعربية\"}. "
+        "إذا لا يوجد تطابق واضح اجعل product_id null و confidence أقل من 0.7.\n"
         "القائمة:\n" + json.dumps(candidates, ensure_ascii=False)
     )
 
@@ -387,7 +361,7 @@ def _gemini_match_product(image_bytes, products):
         "generationConfig": {
             "temperature": 0.1,
             "responseMimeType": "application/json",
-            "maxOutputTokens": 260
+            "maxOutputTokens": 160
         }
     }
     req = urllib.request.Request(
@@ -443,21 +417,10 @@ def _gemini_match_product(image_bytes, products):
             product_id = data.get("product_id")
             if product_id is not None:
                 product_id = int(product_id)
-            suggestions = []
-            for item in data.get("suggestions", []):
-                try:
-                    candidate_id = int(item)
-                    if candidate_id not in suggestions:
-                        suggestions.append(candidate_id)
-                except (TypeError, ValueError):
-                    continue
-            if product_id is not None and product_id not in suggestions:
-                suggestions.insert(0, product_id)
             return {
                 "product_id": product_id,
                 "confidence": max(0.0, min(1.0, confidence)),
                 "reason": str(data.get("reason", ""))[:200],
-                "suggestions": suggestions[:5],
             }
 
         except urllib.error.HTTPError as exc:
@@ -509,22 +472,6 @@ async def csv_document_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
 
-async def reset_photos_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN:
-        return
-    count = db.execute("SELECT COUNT(*) FROM products WHERE photo_id IS NOT NULL").fetchone()[0]
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("نعم، ابدأ من الصفر", callback_data="resetphotos:yes"),
-        InlineKeyboardButton("إلغاء", callback_data="resetphotos:no")
-    ]])
-    await update.message.reply_text(
-        f"⚠️ راح أفصل صور المنتجات القديمة فقط ({count} صورة).\n"
-        "ما راح أحذف أسماء المنتجات أو الأسعار أو الأقسام أو الطلبات أو الكوبونات.\n"
-        "تريد المتابعة؟",
-        reply_markup=kb
-    )
-
-
 async def bulk_photos_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN:
         return
@@ -536,8 +483,8 @@ async def bulk_photos_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     context.user_data["bulk_photo_count"] = 0
     await update.message.reply_text(
         f"📸 وضع ربط الصور بالجملة اشتغل. عندك {count} منتج ينتظر الصورة.\n"
-        "أرسل الصور واحدة ورا الثانية. راح أقترح المنتج الأقرب لكل صورة، وما أربط أي صورة تلقائياً. "
-        "إنت تأكد الربط أو اطلب الاقتراح التالي.\nلإنهاء الدفعة أرسل /endbulk"
+        "أرسل الصور واحدة ورا الثانية أو كألبوم. راح أطابق الواضح تلقائياً، والمشكوك بيه أخليه للمراجعة.\n"
+        "لإنهاء الدفعة أرسل /endbulk"
     )
 
 
@@ -554,58 +501,34 @@ async def bulk_photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if update.effective_user.id != ADMIN or not context.user_data.get("bulk_photo_mode"):
         return
     photo = update.message.photo[-1]
-    photo_id = photo.file_id
-
-    # Never attach the same Telegram photo to more than one product or review.
-    already_linked = db.execute("SELECT name FROM products WHERE photo_id=? LIMIT 1", (photo_id,)).fetchone()
-    already_pending = db.execute("SELECT id FROM photo_matches WHERE photo_id=? LIMIT 1", (photo_id,)).fetchone()
-    if already_linked or already_pending:
-        await update.message.reply_text("⚠️ هاي الصورة مستخدمة أو قيد المراجعة سابقاً، ما راح أكرر ربطها.")
-        return
-
     tgfile = await photo.get_file()
     buf = BytesIO()
     await tgfile.download_to_memory(out=buf)
     candidates = db.execute("""SELECT id,name,(SELECT name FROM categories c WHERE c.id=p.category_id),barcode,source_sku
-                               FROM products p WHERE visible=0 AND import_status='بانتظار الصورة'
-                               AND photo_id IS NULL ORDER BY name LIMIT 250""").fetchall()
+                               FROM products p WHERE visible=0 AND import_status='بانتظار الصورة' ORDER BY name LIMIT 250""").fetchall()
     if not candidates:
         context.user_data["bulk_photo_mode"] = False
-        await update.message.reply_text("🎉 ما بقت منتجات تنتظر الصور.")
+        await update.message.reply_text("🎉 خلصت كل المنتجات اللي كانت تنتظر الصور!")
         return
     try:
         match = await asyncio.to_thread(_gemini_match_product, buf.getvalue(), candidates)
-        valid_ids = {row[0] for row in candidates}
-        suggestions = [pid for pid in match.get("suggestions", []) if pid in valid_ids]
-        if not suggestions and match.get("product_id") in valid_ids:
-            suggestions = [match["product_id"]]
-        if not suggestions:
-            await update.message.reply_text("⚠️ ما لكيت اقتراح مناسب. خلي الصورة بدون ربط وجرب صورة أوضح.")
-            return
-
-        first_id = suggestions[0]
-        cur = db.execute(
-            "INSERT INTO photo_matches(photo_id,product_id,confidence,candidate_ids,suggestion_index,reason) "
-            "VALUES(?,?,?,?,0,?)",
-            (photo_id, first_id, float(match.get("confidence", 0) or 0),
-             json.dumps(suggestions, ensure_ascii=False), match.get("reason", ""))
-        )
-        db.commit()
-        mid = cur.lastrowid
-        product = next(row for row in candidates if row[0] == first_id)
-        price = db.execute("SELECT price FROM products WHERE id=?", (first_id,)).fetchone()[0]
-        kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ نعم، هذا المنتج", callback_data=f"matchapprove:{mid}"),
-            InlineKeyboardButton("🔄 اقتراح ثاني", callback_data=f"matchnext:{mid}")
-        ], [InlineKeyboardButton("⏭️ تجاهل الصورة", callback_data=f"matchskip:{mid}")]])
-        await update.message.reply_photo(
-            photo_id,
-            caption=(f"📸 تأكيد ربط الصورة (ما راح يتم الربط إلا بموافقتك)\n"
-                     f"الاقتراح: {product[1]}\nالسعر: {money(price)}\n"
-                     f"الثقة: {float(match.get('confidence', 0) or 0):.0%}\n"
-                     f"السبب: {match.get('reason', 'مطابقة الصورة')}"),
-            reply_markup=kb
-        )
+        pid = match.get("product_id")
+        confidence = float(match.get("confidence", 0) or 0)
+        found = next((p for p in candidates if p[0] == pid), None)
+        if found and confidence >= 0.82:
+            db.execute("UPDATE products SET photo_id=?,visible=1,import_status='مرتبط تلقائياً' WHERE id=?", (photo.file_id, pid))
+            db.commit()
+            price = db.execute("SELECT price FROM products WHERE id=?", (pid,)).fetchone()[0]
+            await update.message.reply_text(f"✅ تم الربط: {found[1]}\nالسعر: {money(price)}\nالثقة: {confidence:.0%}")
+        elif found:
+            cur = db.execute("INSERT INTO photo_matches(photo_id,product_id,confidence) VALUES(?,?,?)", (photo.file_id, found[0], confidence))
+            db.commit()
+            mid = cur.lastrowid
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ اعتماد هذا المنتج", callback_data=f"matchapprove:{mid}"), InlineKeyboardButton("❌ تجاهل", callback_data=f"matchskip:{mid}")]])
+            price = db.execute("SELECT price FROM products WHERE id=?", (found[0],)).fetchone()[0]
+            await update.message.reply_photo(photo.file_id, caption=f"⚠️ تأكيد الربط مطلوب\nالاقتراح: {found[1]}\nالسعر: {money(price)}\nالثقة: {confidence:.0%}", reply_markup=kb)
+        else:
+            await update.message.reply_text(f"⚠️ ما لكيت تطابق واضح لهالصورة.\nالثقة: {confidence:.0%}\nجرّب تصور المنتج ويظهر اسمه أو باركوده بوضوح.")
     except Exception:
         log.exception("Bulk image matching failed")
         await update.message.reply_text("تعذر تحليل هالصورة حالياً. خليها بدون ربط وجرب مرة ثانية بعدين.")
@@ -629,11 +552,11 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def show_products(q, category_id=None):
     if category_id is None:
         rows = db.execute(
-            "SELECT id,name,price,description,photo_id FROM products WHERE visible=1 ORDER BY id DESC"
+            "SELECT id,name,price,description,photo_id FROM products ORDER BY id DESC"
         ).fetchall()
     else:
         rows = db.execute(
-            "SELECT id,name,price,description,photo_id FROM products WHERE category_id=? AND visible=1 ORDER BY id DESC",
+            "SELECT id,name,price,description,photo_id FROM products WHERE category_id=? ORDER BY id DESC",
             (category_id,)
         ).fetchall()
     if not rows:
@@ -770,87 +693,21 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = q.from_user.id
     data = q.data
 
-    if uid == ADMIN and data == "resetphotos:yes":
-        count = db.execute("SELECT COUNT(*) FROM products WHERE photo_id IS NOT NULL").fetchone()[0]
-        db.execute("UPDATE products SET photo_id=NULL,visible=0,import_status='بانتظار الصورة'")
-        db.execute("DELETE FROM photo_matches")
+    if uid == ADMIN and data.startswith("matchapprove:"):
+        mid = int(data.split(":")[1])
+        row = db.execute("SELECT photo_id,product_id FROM photo_matches WHERE id=?", (mid,)).fetchone()
+        if row:
+            db.execute("UPDATE products SET photo_id=?,visible=1,import_status='تم تأكيد الصورة' WHERE id=?", (row[0], row[1]))
+            db.execute("DELETE FROM photo_matches WHERE id=?", (mid,))
+            db.commit()
+            await q.message.reply_text("✅ تم ربط الصورة بالمنتج وإظهاره للزبائن.")
+        else:
+            await q.message.reply_text("انتهت صلاحية طلب المراجعة.")
+    elif uid == ADMIN and data.startswith("matchskip:"):
+        mid = int(data.split(":")[1])
+        db.execute("DELETE FROM photo_matches WHERE id=?", (mid,))
         db.commit()
-        await q.edit_message_reply_markup(reply_markup=None)
-        await q.message.reply_text(
-            f"✅ تم فصل {count} صورة قديمة. المنتجات والأسعار والأقسام والطلبات والكوبونات باقية مثل ما هي.\n"
-            "هسه استورد الصور من جديد باستخدام /bulkphotos بعد التأكد أن المنتجات تنتظر الصور."
-        )
-    elif uid == ADMIN and data == "resetphotos:no":
-        await q.edit_message_reply_markup(reply_markup=None)
-        await q.message.reply_text("تم الإلغاء، ما تغير أي شيء.")
-    elif uid == ADMIN and (data.startswith("matchapprove:") or data.startswith("matchnext:") or data.startswith("matchskip:")):
-        action, raw_mid = data.split(":", 1)
-        mid = int(raw_mid)
-        review = db.execute(
-            "SELECT photo_id,product_id,confidence,candidate_ids,suggestion_index FROM photo_matches WHERE id=?",
-            (mid,)
-        ).fetchone()
-        if not review:
-            await q.message.reply_text("انتهت صلاحية طلب مراجعة الصورة.")
-            return
-        photo_id, product_id, confidence, raw_candidates, suggestion_index = review
-        candidate_ids = []
-        try:
-            candidate_ids = [int(x) for x in json.loads(raw_candidates or "[]")]
-        except (TypeError, ValueError, json.JSONDecodeError):
-            candidate_ids = [product_id]
-
-        if action == "matchapprove":
-            duplicate = db.execute("SELECT id FROM products WHERE photo_id=? AND id!=? LIMIT 1", (photo_id, product_id)).fetchone()
-            product = db.execute("SELECT name FROM products WHERE id=?", (product_id,)).fetchone()
-            if duplicate:
-                db.execute("DELETE FROM photo_matches WHERE id=?", (mid,))
-                db.commit()
-                await q.message.reply_text("⚠️ الصورة مرتبطة بمنتج آخر بالفعل؛ ألغيت المراجعة لمنع التكرار.")
-                return
-            if not product:
-                await q.message.reply_text("المنتج المقترح لم يعد موجوداً.")
-                return
-            db.execute("UPDATE products SET photo_id=?,visible=1,import_status='تم تأكيد الصورة' WHERE id=?", (photo_id, product_id))
-            db.execute("DELETE FROM photo_matches WHERE id=?", (mid,))
-            db.commit()
-            await q.edit_message_reply_markup(reply_markup=None)
-            await q.message.reply_text(f"✅ تم تأكيد الصورة وربطها بالمنتج: {product[0]}.")
-
-        elif action == "matchnext":
-            next_index = suggestion_index + 1
-            next_product_id = None
-            while next_index < len(candidate_ids):
-                candidate_id = candidate_ids[next_index]
-                candidate = db.execute(
-                    "SELECT id,name,price FROM products WHERE id=? AND visible=0 AND photo_id IS NULL",
-                    (candidate_id,)
-                ).fetchone()
-                if candidate:
-                    next_product_id = candidate_id
-                    break
-                next_index += 1
-            if next_product_id is None:
-                await q.message.reply_text("ماكو اقتراحات أخرى محفوظة لهالصورة. تگدر تتجاهلها أو تعيد إرسالها بصورة أوضح.")
-                return
-            db.execute("UPDATE photo_matches SET product_id=?,suggestion_index=? WHERE id=?", (next_product_id, next_index, mid))
-            db.commit()
-            candidate = db.execute("SELECT name,price FROM products WHERE id=?", (next_product_id,)).fetchone()
-            kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ نعم، هذا المنتج", callback_data=f"matchapprove:{mid}"),
-                InlineKeyboardButton("🔄 اقتراح ثاني", callback_data=f"matchnext:{mid}")
-            ], [InlineKeyboardButton("⏭️ تجاهل الصورة", callback_data=f"matchskip:{mid}")]])
-            await q.message.reply_photo(
-                photo_id,
-                caption=f"🔄 الاقتراح التالي للصورة:\n{candidate[0]}\nالسعر: {money(candidate[1])}\nالثقة السابقة: {float(confidence or 0):.0%}",
-                reply_markup=kb
-            )
-
-        else:  # matchskip
-            db.execute("DELETE FROM photo_matches WHERE id=?", (mid,))
-            db.commit()
-            await q.edit_message_reply_markup(reply_markup=None)
-            await q.message.reply_text("تم تجاهل الصورة. ما تم ربطها بأي منتج.")
+        await q.message.reply_text("تم تجاهل المطابقة. المنتج بقي مخفياً.")
     elif uid == ADMIN and data == "admin_import_help":
         await q.message.reply_text("لاستيراد قائمة Loyverse استخدم الأمر /importcsv ثم أرسل ملف CSV.")
     elif uid == ADMIN and data == "admin_bulk_help":
@@ -1391,10 +1248,11 @@ async def ad_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         image = make_ad_image(raw_photo, price)
         caption = (
             f"🛍️ {description}\n\n"
-            f"💰 السعر: {price} دينار\n"
-            "📩 للطلب والحجز: @LLL_54\n"
+            f"💰 السعر: {price} دينار\n\n"
+            "👤 حسابنا: @LLL_54\n"
+            "🛒 للطلب المباشر: @AlQudsOrdersBot\n\n"
             "🚚 التوصيل مجاني داخل النجف\n"
-            "🛍️ مجمع القدس"
+            "❤️ مجمع القدس"
         )
         await context.bot.send_photo(chat_id=CHANNEL_ID, photo=image, caption=caption)
         context.user_data.pop("ad_mode", None)
@@ -1435,7 +1293,6 @@ async def main_async():
     orders_app.add_handler(CommandHandler("importcsv", import_csv_command))
     orders_app.add_handler(CommandHandler("bulkphotos", bulk_photos_command))
     orders_app.add_handler(CommandHandler("endbulk", end_bulk_command))
-    orders_app.add_handler(CommandHandler("resetphotos", reset_photos_command))
     orders_app.add_handler(MessageHandler(filters.Document.ALL, csv_document_handler))
     orders_app.add_handler(MessageHandler(filters.PHOTO, bulk_photo_handler), group=1)
     orders_app.add_handler(CallbackQueryHandler(buttons))
