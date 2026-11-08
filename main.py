@@ -6,6 +6,7 @@ import threading
 import base64
 import json
 import urllib.request
+import urllib.error
 import time
 import csv
 import re
@@ -337,13 +338,37 @@ def _gemini_match_product(image_bytes, products):
     url = ("https://generativelanguage.googleapis.com/v1beta/models/" f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}")
     payload = {"contents": [{"parts": [{"text": prompt}, {"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(image_bytes).decode("ascii")}}]}],
                "generationConfig": {"temperature": 0.1, "responseMimeType": "application/json", "maxOutputTokens": 120}}
-    req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"}, method="POST")
-    with urllib.request.urlopen(req, timeout=30) as response:
-        result = json.loads(response.read().decode())
-    parts = result.get("candidates", [{}])[0].get("content", {}).get("parts", [])
-    raw = "".join(x.get("text", "") for x in parts).strip()
-    data = json.loads(raw)
-    return data
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    # Gemini may temporarily time out or return 503/429. Retry with backoff.
+    last_error = None
+    for attempt, delay in enumerate((0, 4, 10, 18), start=1):
+        if delay:
+            time.sleep(delay)
+        try:
+            with urllib.request.urlopen(req, timeout=75) as response:
+                result = json.loads(response.read().decode("utf-8"))
+            parts = result.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+            raw = "".join(x.get("text", "") for x in parts).strip()
+            if not raw:
+                raise ValueError("Gemini returned an empty response")
+            data = json.loads(raw)
+            return data
+        except urllib.error.HTTPError as exc:
+            last_error = exc
+            if exc.code not in (429, 500, 502, 503, 504):
+                raise
+            log.warning("Gemini temporary HTTP %s on attempt %s/4", exc.code, attempt)
+        except (TimeoutError, urllib.error.URLError, ConnectionError) as exc:
+            last_error = exc
+            log.warning("Gemini connection timeout/error on attempt %s/4: %s", attempt, type(exc).__name__)
+
+    raise RuntimeError(f"Gemini unavailable after 4 attempts: {type(last_error).__name__ if last_error else 'unknown error'}")
 
 
 async def import_csv_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
