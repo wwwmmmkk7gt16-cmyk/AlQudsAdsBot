@@ -328,16 +328,42 @@ def import_loyverse_csv(raw_bytes):
 def _gemini_match_product(image_bytes, products):
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY غير مضبوط")
-    candidates = [{"id": p[0], "name": p[1], "category": p[2] or "", "barcode": p[3] or "", "sku": p[4] or ""} for p in products]
+
+    candidates = [
+        {"id": p[0], "name": p[1], "category": p[2] or "",
+         "barcode": p[3] or "", "sku": p[4] or ""}
+        for p in products
+    ]
     prompt = (
         "أنت نظام مطابقة صور لمتجر. اختر المنتج المطابق للصورة من القائمة فقط. "
         "اعتمد على النص الظاهر والباركود والشكل. لا تخمّن عند التشابه. "
-        "أرجع JSON فقط بالشكل: {\\\"product_id\\\": رقم أو null, \\\"confidence\\\": رقم من 0 إلى 1, \\\"reason\\\": \\\"سبب قصير بالعربية\\\"}. "
-        "إذا لا يوجد تطابق واضح اجعل product_id null و confidence أقل من 0.7.\nالقائمة:\n" + json.dumps(candidates, ensure_ascii=False)
+        "أرجع كائن JSON صالحاً فقط دون Markdown أو شرح، بالشكل: "
+        "{\"product_id\": رقم أو null, \"confidence\": رقم من 0 إلى 1, "
+        "\"reason\": \"سبب قصير بالعربية\"}. "
+        "إذا لا يوجد تطابق واضح اجعل product_id null و confidence أقل من 0.7.\n"
+        "القائمة:\n" + json.dumps(candidates, ensure_ascii=False)
     )
-    url = ("https://generativelanguage.googleapis.com/v1beta/models/" f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}")
-    payload = {"contents": [{"parts": [{"text": prompt}, {"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(image_bytes).decode("ascii")}}]}],
-               "generationConfig": {"temperature": 0.1, "responseMimeType": "application/json", "maxOutputTokens": 120}}
+
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    )
+    payload = {
+        "contents": [{
+            "parts": [
+                {"text": prompt},
+                {"inline_data": {
+                    "mime_type": "image/jpeg",
+                    "data": base64.b64encode(image_bytes).decode("ascii")
+                }}
+            ]
+        }],
+        "generationConfig": {
+            "temperature": 0.1,
+            "responseMimeType": "application/json",
+            "maxOutputTokens": 160
+        }
+    }
     req = urllib.request.Request(
         url,
         data=json.dumps(payload).encode("utf-8"),
@@ -345,30 +371,75 @@ def _gemini_match_product(image_bytes, products):
         method="POST",
     )
 
-    # Gemini may temporarily time out or return 503/429. Retry with backoff.
     last_error = None
-    for attempt, delay in enumerate((0, 4, 10, 18), start=1):
+    for attempt, delay in enumerate((0, 5, 12, 20), start=1):
         if delay:
             time.sleep(delay)
         try:
-            with urllib.request.urlopen(req, timeout=75) as response:
-                result = json.loads(response.read().decode("utf-8"))
-            parts = result.get("candidates", [{}])[0].get("content", {}).get("parts", [])
-            raw = "".join(x.get("text", "") for x in parts).strip()
+            with urllib.request.urlopen(req, timeout=90) as response:
+                response_text = response.read().decode("utf-8", errors="replace")
+
+            if not response_text.strip():
+                raise ValueError("Gemini returned an empty HTTP response")
+
+            envelope = json.loads(response_text)
+            candidates_out = envelope.get("candidates") or []
+            if not candidates_out:
+                prompt_feedback = envelope.get("promptFeedback", {})
+                raise ValueError(
+                    "Gemini returned no candidates: "
+                    + json.dumps(prompt_feedback, ensure_ascii=False)[:300]
+                )
+
+            parts = (candidates_out[0].get("content") or {}).get("parts") or []
+            raw = "".join(part.get("text", "") for part in parts).strip()
             if not raw:
-                raise ValueError("Gemini returned an empty response")
-            data = json.loads(raw)
-            return data
+                finish_reason = candidates_out[0].get("finishReason", "unknown")
+                raise ValueError(f"Gemini returned empty model text (finishReason={finish_reason})")
+
+            # Tolerate accidental Markdown fences or text around the JSON object.
+            cleaned = raw.strip()
+            cleaned = re.sub(r"^\s*```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+            cleaned = re.sub(r"\s*```\s*$", "", cleaned)
+            try:
+                data = json.loads(cleaned)
+            except json.JSONDecodeError:
+                first = cleaned.find("{")
+                last = cleaned.rfind("}")
+                if first < 0 or last <= first:
+                    raise ValueError("Gemini response did not contain a JSON object")
+                data = json.loads(cleaned[first:last + 1])
+
+            if not isinstance(data, dict):
+                raise ValueError("Gemini JSON response was not an object")
+
+            confidence = float(data.get("confidence", 0) or 0)
+            product_id = data.get("product_id")
+            if product_id is not None:
+                product_id = int(product_id)
+            return {
+                "product_id": product_id,
+                "confidence": max(0.0, min(1.0, confidence)),
+                "reason": str(data.get("reason", ""))[:200],
+            }
+
         except urllib.error.HTTPError as exc:
             last_error = exc
             if exc.code not in (429, 500, 502, 503, 504):
                 raise
             log.warning("Gemini temporary HTTP %s on attempt %s/4", exc.code, attempt)
-        except (TimeoutError, urllib.error.URLError, ConnectionError) as exc:
+        except (TimeoutError, urllib.error.URLError, ConnectionError,
+                ValueError, json.JSONDecodeError) as exc:
             last_error = exc
-            log.warning("Gemini connection timeout/error on attempt %s/4: %s", attempt, type(exc).__name__)
+            log.warning(
+                "Gemini request/response failed on attempt %s/4: %s: %s",
+                attempt, type(exc).__name__, str(exc)[:180]
+            )
 
-    raise RuntimeError(f"Gemini unavailable after 4 attempts: {type(last_error).__name__ if last_error else 'unknown error'}")
+    raise RuntimeError(
+        "Gemini unavailable or returned invalid JSON after 4 attempts: "
+        f"{type(last_error).__name__ if last_error else 'unknown error'}"
+    )
 
 
 async def import_csv_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
