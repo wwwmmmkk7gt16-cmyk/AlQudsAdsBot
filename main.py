@@ -579,9 +579,13 @@ async def bulk_photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         suggestions = [pid for pid in match.get("suggestions", []) if pid in valid_ids]
         if not suggestions and match.get("product_id") in valid_ids:
             suggestions = [match["product_id"]]
-        if not suggestions:
-            await update.message.reply_text("⚠️ ما لكيت اقتراح مناسب. خلي الصورة بدون ربط وجرب صورة أوضح.")
-            return
+                if not suggestions:
+            suggestions = [row[0] for row in candidates[:5]]
+            if not suggestions:
+                await update.message.reply_text("ماكو منتجات تنتظر ربط الصور حالياً.")
+                return
+            match["confidence"] = 0.0
+            match["reason"] = "اقتراحات للمراجعة اليدوية"
 
         first_id = suggestions[0]
         cur = db.execute(
